@@ -1,0 +1,144 @@
+import os
+import pandas as pd
+from datasets import load_dataset
+from langchain_community.vectorstores import Neo4jVector
+from langchain_community.embeddings import HuggingFaceEmbeddings
+from langchain.text_splitter import RecursiveCharacterTextSplitter
+from langchain_neo4j import Neo4jGraph
+from langchain.chains import RetrievalQA
+from langchain_ollama import OllamaLLM
+from langchain.document_loaders import PyPDFLoader
+from sentence_transformers import SentenceTransformer
+from nltk.translate.bleu_score import sentence_bleu
+from rouge import Rouge
+from transformers import pipeline, AutoTokenizer
+from dotenv import load_dotenv
+
+# ✅ Load environment variables
+load_dotenv()
+
+# ✅ Neo4j credentials
+NEO4J_URI = os.getenv("NEO4J_URI", "bolt://localhost:7687")
+NEO4J_USERNAME = os.getenv("NEO4J_USERNAME", "neo4j")
+NEO4J_PASSWORD = os.getenv("NEO4J_PASSWORD", "viratkohli18")
+
+# ✅ Load PDF
+pdf_path = "responses.pdf"
+loader = PyPDFLoader(pdf_path)
+pages = loader.load()
+
+# ✅ Chunk the text
+text_splitter = RecursiveCharacterTextSplitter(chunk_size=500, chunk_overlap=50)
+documents = text_splitter.split_documents(pages)
+
+# ✅ Convert to text
+docs_to_add = [
+    {
+        "page_content": doc.page_content.strip(),
+        "metadata": {"source": f"Page {i+1}"}
+    }
+    for i, doc in enumerate(documents)
+]
+
+# ✅ Initialize Hugging Face Embeddings
+hf_embeddings = HuggingFaceEmbeddings(model_name="sentence-transformers/all-MiniLM-L6-v2")
+
+# ✅ Store PDF embeddings in Neo4j
+neo4j_vector = Neo4jVector.from_documents(
+    documents, hf_embeddings, url=NEO4J_URI, username=NEO4J_USERNAME, password=NEO4J_PASSWORD
+)
+
+print("✅ PDF chunks stored in Neo4j successfully!")
+
+# ✅ Initialize Llama3.2 Model
+llm = OllamaLLM(model="llama3.2")
+
+# ✅ Retrieval QA Chain
+qa_chain = RetrievalQA.from_llm(
+    llm=llm,
+    retriever=neo4j_vector.as_retriever(search_kwargs={"k": 3}),
+    return_source_documents=True
+)
+
+# ✅ Load Medical Dataset & Select First 50 Questions
+dataset = load_dataset("lavita/medical-eval-sphere")
+df = dataset["medical_qa_benchmark_v1.0"].to_pandas()
+df = df[["medical_question", "response_a"]].dropna()
+test_cases = df.head(50).to_dict("records")  # First 50 questions
+
+# ✅ Initialize evaluation metrics
+rouge = Rouge()
+output_lines = []
+total_bleu = 0
+total_rouge = 0
+total_consistency = 0
+
+# ✅ Initialize Vectara Consistency Model
+classifier = pipeline(
+    "text-classification",
+    model='vectara/hallucination_evaluation_model',
+    tokenizer=AutoTokenizer.from_pretrained('google/flan-t5-base'),
+    trust_remote_code=True
+)
+
+# ✅ Run Evaluation
+for idx, test in enumerate(test_cases, start=1):
+    query = test["medical_question"]
+    expected_answer = test["response_a"]
+
+    response = qa_chain.invoke(query)
+    generated_answer = response["result"]
+
+    # ✅ Compute BLEU Score
+    bleu_score = sentence_bleu([expected_answer.split()], generated_answer.split())
+    total_bleu += bleu_score
+
+    # ✅ Compute ROUGE Score
+    rouge_score = rouge.get_scores(generated_answer, expected_answer)[0]['rouge-l']['f']
+    total_rouge += rouge_score
+
+    # ✅ Compute Vectara Consistency Score
+    consistency_score = classifier(generated_answer)[0]['score']
+    total_consistency += consistency_score
+
+    # ✅ Store results
+    output_lines.append(f"\n🔹 Question {idx}: {query}")
+    output_lines.append(f"Generated Answer: {generated_answer}")
+    output_lines.append(f"Expected Answer: {expected_answer}")
+    output_lines.append(f"BLEU Score: {bleu_score:.4f}")
+    output_lines.append(f"ROUGE-L Score: {rouge_score:.4f}")
+    output_lines.append(f"Vectara Consistency Score: {consistency_score:.4f}")
+
+    # ✅ Print sources
+    output_lines.append("\nSources:")
+    for i, doc in enumerate(response["source_documents"]):
+        output_lines.append(f"Source {i+1}: {doc.page_content[:300]}...")  # First 300 chars
+
+# ✅ Compute Averages
+num_tests = len(test_cases)
+avg_bleu = total_bleu / num_tests
+avg_rouge = total_rouge / num_tests
+avg_consistency = total_consistency / num_tests
+
+# ✅ Append average scores
+output_lines.append("\n✅ **Overall Evaluation Metrics:**")
+output_lines.append(f"🔹 Average BLEU Score: {avg_bleu:.4f}")
+output_lines.append(f"🔹 Average ROUGE-L Score: {avg_rouge:.4f}")
+output_lines.append(f"🔹 Average Vectara Consistency Score: {avg_consistency:.4f}")
+
+# ✅ Save results to a text file
+with open("medical_qa_results.txt", "w", encoding="utf-8") as file:
+    file.write("\n".join(output_lines))
+
+
+# ✅ Print final averages
+print("\n✅ **Overall Evaluation Metrics:**")
+print(f"🔹 Average BLEU Score: {avg_bleu:.4f}")
+print(f"🔹 Average ROUGE-L Score: {avg_rouge:.4f}")
+print(f"🔹 Average Vectara Consistency Score: {avg_consistency:.4f}")
+
+print("✅ Medical QA evaluation completed! Results saved in 'medical_qa_results.txt'.")
+
+
+
+

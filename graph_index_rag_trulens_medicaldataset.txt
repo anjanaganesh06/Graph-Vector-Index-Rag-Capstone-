@@ -1,0 +1,144 @@
+import numpy as np
+import os
+import pandas as pd
+from datasets import load_dataset
+from dotenv import load_dotenv
+from langchain.text_splitter import RecursiveCharacterTextSplitter
+from langchain.document_loaders import PyPDFLoader
+from langchain.chains import RetrievalQA
+from langchain_ollama import OllamaLLM
+from langchain_community.embeddings import HuggingFaceEmbeddings
+from langchain_community.vectorstores import Neo4jVector
+
+# from trulens.providers.tru_feedback import Groundedness, Relevance
+from trulens.apps.app import TruApp
+from trulens.dashboard import run_dashboard
+from trulens.apps.app import instrument
+import litellm
+from trulens.providers.litellm import LiteLLM
+from trulens.core import Feedback, Select, TruSession
+
+# ✅ Load environment variables
+load_dotenv()
+session = TruSession()
+session.reset_database()
+# ✅ Neo4j Credentials
+NEO4J_URI = os.getenv("NEO4J_URI", "bolt://localhost:7687")
+NEO4J_USERNAME = os.getenv("NEO4J_USERNAME", "neo4j")
+NEO4J_PASSWORD = os.getenv("NEO4J_PASSWORD", "viratkohli18")
+
+# ✅ Load PDF and Split Text
+pdf_path = "responses.pdf"
+loader = PyPDFLoader(pdf_path)
+pages = loader.load()
+provider = LiteLLM(model_engine="ollama/llama3.2")
+
+text_splitter = RecursiveCharacterTextSplitter(chunk_size=500, chunk_overlap=50)
+documents = text_splitter.split_documents(pages)
+
+# ✅ Initialize Hugging Face Embeddings
+hf_embeddings = HuggingFaceEmbeddings(model_name="sentence-transformers/all-MiniLM-L6-v2")
+
+# ✅ Store PDF embeddings in Neo4j
+neo4j_vector = Neo4jVector.from_documents(
+    documents, hf_embeddings, url=NEO4J_URI, username=NEO4J_USERNAME, password=NEO4J_PASSWORD
+)
+# ✅ Load Medical Dataset & Select First 50 Questions
+dataset = load_dataset("lavita/medical-eval-sphere")
+df = dataset["medical_qa_benchmark_v1.0"].to_pandas()
+df = df[["medical_question", "response_a"]].dropna()
+test_cases = df.head(50).to_dict("records")  # First 50 questions
+
+print("✅ PDF chunks stored in Neo4j successfully!")
+
+# ✅ Initialize Llama3.2 Model
+llm = OllamaLLM(model="llama3.2")
+
+# ✅ Define Retrieval QA Chain
+qa_chain = RetrievalQA.from_llm(
+    llm=llm,
+    retriever=neo4j_vector.as_retriever(search_kwargs={"k": 3}),
+    return_source_documents=True
+)
+
+f_groundedness = (
+    Feedback(
+       provider.groundedness_measure_with_cot_reasons, name="Groundedness"
+    )
+    .on(Select.RecordCalls.retrieve.rets[:])  # Ensure it checks retrieved context
+    .on_output()
+)
+
+f_answer_relevance = (
+    Feedback(provider.relevance_with_cot_reasons, name="Answer Relevance")
+    .on_input()
+    .on_output()
+)
+
+f_context_relevance = (
+    Feedback(provider.context_relevance, name="Context Relevance")
+    .on_input()
+    .on(Select.RecordCalls.retrieve.rets[:])
+    .aggregate(np.mean)
+)
+
+# ✅ Define Graph-Based Retrieval
+@instrument
+def graph_retrieve(query: str, top_k=3):
+    """Retrieve relevant nodes from Neo4j Vector Index."""
+    results = neo4j_vector.similarity_search(query, k=top_k)
+    return [doc.page_content for doc in results]
+
+# ✅ Define RAG Pipeline with Instrumentation
+class GraphRAG:
+    def __init__(self, vector_store):
+        self.vector_store = vector_store
+
+    @instrument
+    def retrieve(self, query: str) -> list:
+        """Retrieve relevant text from Neo4j-based vector index."""
+        results = neo4j_vector.similarity_search(query, k=3)
+        return [doc.page_content for doc in results]
+    
+    @instrument
+    def query(self, query: str) -> str:
+        """Retrieve context and generate a response using Llama3."""
+        retrieved_docs = self.retrieve(query)
+        context = "\n".join(retrieved_docs) if retrieved_docs else "No relevant context found."
+        
+        prompt = f"Context: {context}\n\nQuestion: {query}\nAnswer:"
+        response = litellm.completion(
+            model="ollama/llama3.2",
+            messages=[{"role": "user", "content": prompt}],
+            context_str=context,
+            max_tokens=150  # Adjust as needed
+
+        )
+        return response["choices"][0]["message"]["content"]
+
+rag = GraphRAG(neo4j_vector)
+
+# ✅ Initialize TruLens for RAG Evaluation
+tru_rag = TruApp(
+    rag,
+    app_name="GraphRAG2",
+    app_version="v2",
+    feedbacks=[f_groundedness, f_answer_relevance, f_context_relevance],
+)
+
+# ✅ Load the first 5 questions as queries
+queries = df["medical_question"].head(5).tolist()
+
+# ✅ Run Queries & Record Feedback
+with tru_rag as recording:
+    for i, query in enumerate(queries, 1):
+        print(f"Query {i}: {query}")
+        print("Response:", rag.query(query))
+        print("-" * 80)  # Separator for readability
+
+print("\n🔍 *TruLens Evaluation Metrics:*")
+leaderboard = session.get_leaderboard()
+print(leaderboard)
+
+# ✅ Launch TruLens Dashboard
+run_dashboard(session)
